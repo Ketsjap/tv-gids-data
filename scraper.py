@@ -13,100 +13,91 @@ ALLOWED_KEYWORDS = [
     "vtm", "vrt", "canvas", "ketnet", "play", "npo", "bbc", "national", "discovery", "tlc"
 ]
 
-def get_belgium_date():
-    tz = pytz.timezone('Europe/Brussels')
-    return datetime.now(tz).strftime("%Y-%m-%d")
+# Hier slaan we de onderschepte data in op
+captured_uuids = []
 
-def get_overview_uuids_with_browser():
+def handle_response(response):
+    """Luistert naar netwerkverkeer en pakt de API json"""
+    try:
+        # We zoeken naar responses van de broadcasts API
+        if "api/v2/broadcasts" in response.url and response.status == 200:
+            print(f"📡 API Response onderschept: {response.url}")
+            try:
+                data = response.json()
+                
+                if 'channels' in data:
+                    print(f"   -> JSON bevat {len(data['channels'])} kanalen. Parsen...")
+                    
+                    for ch in data['channels']:
+                        name = ch.get('name', '').lower()
+                        slug = name.replace(' ', '-')
+                        
+                        # Filter op zenders
+                        if any(k in name for k in ALLOWED_KEYWORDS):
+                            broadcasts = ch.get('broadcasts', [])
+                            for b in broadcasts:
+                                uuid = b.get('id')
+                                # Bouw de URL voor stap 2
+                                url = f"https://www.humo.be/tv-gids/{slug}/uitzending/aflevering/{uuid}"
+                                captured_uuids.append((uuid, url))
+            except:
+                pass # Geen JSON of parse error
+    except:
+        pass
+
+def get_uuids_via_network_sniffing():
     url = "https://www.humo.be/tv-gids"
-    print(f"📡 Stap 1: Browser starten naar {url}...")
-    
-    tasks = []
+    print(f"📡 Stap 1: Browser starten en luisteren naar API verkeer...")
     
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(viewport={'width': 1920, 'height': 1080})
         page = context.new_page()
         
+        # ACTIVEER DE "SNIFFER"
+        page.on("response", handle_response)
+        
         try:
             page.goto(url, timeout=60000, wait_until="domcontentloaded")
-            print("   -> Pagina geladen. Wachten op banner...")
-            page.wait_for_timeout(3000)
-
-            # 🍪 COOKIE HUNTER
-            clicked = False
+            print("   -> Pagina aan het laden...")
+            
+            # Wacht even en accepteer cookies (zodat de API call zeker vertrekt)
             try:
-                # Probeer 'Akkoord' knop
-                btn = page.locator("button, a").filter(has_text=re.compile("(?i)^Akkoord$"))
-                if btn.count() > 0 and btn.first.is_visible():
-                    btn.first.click()
-                    print("   -> 🍪 'Akkoord' geklikt!")
-                    clicked = True
+                page.wait_for_timeout(2000)
+                btn = page.get_by_role("button", name="Akkoord")
+                if btn.is_visible():
+                    btn.click()
+                    print("   -> 🍪 Cookies geaccepteerd")
+                    page.wait_for_timeout(2000)
             except: pass
             
-            if not clicked:
-                # Fallback: iframes
-                for frame in page.frames:
-                    try:
-                        btn = frame.locator("button, a").filter(has_text=re.compile("(?i)^Akkoord$"))
-                        if btn.count() > 0 and btn.first.is_visible():
-                            btn.first.click()
-                            print(f"   -> 🍪 'Akkoord' geklikt in iframe!")
-                            clicked = True
-                            break
-                    except: continue
-
-            if clicked:
-                page.wait_for_timeout(3000)
-
-            # Screenshot ter controle
-            page.screenshot(path="debug_grid.png", full_page=True)
-
-            print("   -> Scrollen door de gids...")
-            # Iets agressiever scrollen om alles te laden
-            for _ in range(8):
-                page.mouse.wheel(0, 1500)
-                page.wait_for_timeout(800)
+            # Scrollen is vaak nodig om de API call te triggeren
+            print("   -> Scrollen om data te forceren...")
+            for _ in range(5):
+                page.mouse.wheel(0, 1000)
+                page.wait_for_timeout(1000)
             
-            # 🔥 NIEUWE STRATEGIE: Pak ALLE links, filter later
-            # We kijken specifiek naar links die een 'href' hebben
-            links = page.evaluate("""() => {
-                return Array.from(document.querySelectorAll('a[href]')).map(a => a.href)
-            }""")
-            
-            print(f"   -> {len(links)} totale links gevonden. Nu filteren...")
-            
-            for href in links:
-                # Moet een Humo link zijn en een van onze zenders bevatten
-                if "humo.be" not in href: continue
-                
-                # Check zender
-                if not any(k in href for k in ALLOWED_KEYWORDS): continue
-                
-                # Check of het een programma-link is
-                # Humo gebruikt soms /tv-gids/.../uitzending/... en soms /tv-gids/programma/...
-                if "/uitzending/" in href or "/programma/" in href:
-                    
-                    # UUID extractie: pak het laatste deel dat geen lege string is
-                    parts = [p for p in href.split('/') if p]
-                    uuid = parts[-1]
-                    
-                    # UUID is meestal lang (hash) of numeriek ID
-                    if len(uuid) > 5:
-                         tasks.append((uuid, href))
-                
+            # Als we nog geen data hebben, klik op 'Nu & Straks' om een refresh te forceren
+            if len(captured_uuids) == 0:
+                print("   -> Nog geen data, we klikken op 'Zenders'...")
+                try:
+                    page.goto("https://www.humo.be/tv-gids/zenders", timeout=30000)
+                    page.wait_for_timeout(4000)
+                except: pass
+
         except Exception as e:
             print(f"❌ Browser fout: {e}")
         finally:
             browser.close()
             
     # Uniek maken
-    unique_tasks = list({t[0]: t for t in tasks}.values())
+    unique_tasks = list({t[0]: t for t in captured_uuids}.values())
     return unique_tasks
 
 def scrape_detail(task):
     uuid, url = task
     try:
+        # Stap 2 blijft via curl_cffi (snel en efficiënt)
         resp = requests.get(url, impersonate="chrome110", timeout=20)
         
         if resp.status_code != 200: return None
@@ -149,12 +140,12 @@ def scrape_detail(task):
         return None
 
 def main():
-    print("🚀 Script gestart (Link Harvest Mode)...")
+    print("🚀 Script gestart (Network Sniffer Mode)...")
     
-    tasks = get_overview_uuids_with_browser()
+    tasks = get_uuids_via_network_sniffing()
     
     if not tasks:
-        print("❌ Geen TV-programma's gevonden. Bekijk 'debug_grid.png'.")
+        print("❌ Geen API data onderschept. Humo heeft iets veranderd.")
         sys.exit(1)
         
     print(f"🔍 Stap 2: {len(tasks)} details scrapen...")
