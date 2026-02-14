@@ -20,78 +20,80 @@ def get_belgium_date():
 
 def get_overview_uuids_with_browser():
     date = get_belgium_date()
-    # We gaan naar de hoofdpagina, dat is vaak stabieler
-    url = f"https://www.humo.be/tv-gids/{date}"
+    # We gaan naar de zenders-specifieke pagina, die laadt soms beter
+    url = f"https://www.humo.be/tv-gids/{date}/zenders"
     
     print(f"📡 Stap 1: Browser starten naar {url}...")
     
     tasks = []
     
     with sync_playwright() as p:
-        # Launch options: Headless, maar met specifieke args om detectie te verminderen
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            viewport={'width': 1920, 'height': 1080}, # Groot scherm simuleren
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        )
+        # We zetten een grote viewport zodat de knop zeker in beeld is
+        context = browser.new_context(viewport={'width': 1920, 'height': 1080})
         page = context.new_page()
         
         try:
             page.goto(url, timeout=60000, wait_until="domcontentloaded")
-            print("   -> Pagina geladen. Zoeken naar cookie banner...")
+            print("   -> Pagina geladen. Wachten op cookie banner...")
+            
+            # Wacht even expliciet tot de overlay er is
+            page.wait_for_timeout(3000)
 
-            # 🍪 PROBEER COOKIES TE ACCEPTEREN
+            # 🍪 COOKIE FIX VOOR DE SCREENSHOT
             try:
-                # DPG Media gebruikt vaak een iframe of shadow dom, of gewoon buttons
-                # We proberen een paar generieke selectors
-                accept_button = page.get_by_role("button", name="Alles accepteren")
-                if accept_button.is_visible():
-                    accept_button.click()
-                    print("   -> 🍪 Cookies geaccepteerd!")
-                    page.wait_for_timeout(2000) # Even wachten op reload
+                # We zoeken naar de knop met tekst "Akkoord" (ongeacht hoofdletters)
+                # We klikken op de eerste die we vinden die zichtbaar is
+                accept_button = page.locator("button", has_text=re.compile("(?i)akkoord"))
+                
+                if accept_button.count() > 0 and accept_button.first.is_visible():
+                    print("   -> 🍪 'Akkoord' knop gevonden! Klikken...")
+                    accept_button.first.click()
+                    page.wait_for_timeout(3000) # Wachten tot banner weg is
                 else:
-                    # Soms is het 'Akkoord' of 'Verdergaan'
-                    page.locator("button:has-text('aanvaarden')").click(timeout=2000)
-                    print("   -> 🍪 Cookies (alt) geaccepteerd!")
-            except:
-                print("   -> Geen cookie banner gevonden (of timeout). We gaan door.")
+                    print("   -> ⚠️ Geen 'Akkoord' knop gevonden. We proberen de frames...")
+                    # Soms zit DPG in een iframe
+                    for frame in page.frames:
+                        btn = frame.locator("button", has_text=re.compile("(?i)akkoord"))
+                        if btn.count() > 0 and btn.first.is_visible():
+                            print("   -> 🍪 'Akkoord' gevonden in iframe! Klikken...")
+                            btn.first.click()
+                            page.wait_for_timeout(3000)
+                            break
+            except Exception as e:
+                print(f"   -> Fout bij klikken cookies: {e}")
 
-            # Scrollen om lazy loading te triggeren
-            print("   -> Scrollen...")
+            # Even checken of we erdoor zijn door een screenshot te maken (overschrijft de oude)
+            page.screenshot(path="debug_after_click.png", full_page=True)
+
+            # Scrollen om lazy loading te triggeren (Humo laadt pas als je scrollt)
+            print("   -> Scrollen door de gids...")
             for _ in range(5):
                 page.mouse.wheel(0, 1000)
                 page.wait_for_timeout(1000)
             
-            # MAAK SCREENSHOT VOOR DEBUGGING (wordt geupload naar GitHub)
-            page.screenshot(path="debug_page.png", full_page=True)
-            print("   -> 📸 Screenshot gemaakt (debug_page.png)")
-
-            # Zoek links. De selector is iets breder gemaakt.
-            # We zoeken naar links die '/uitzending/' of '/programma/' bevatten
-            links = page.locator("a[href*='/tv-gids/']").all()
+            # Zoek links
+            # We zoeken specifiek naar links die naar een detailpagina leiden
+            links = page.locator("a[href*='/uitzending/'], a[href*='/programma/']").all()
             
-            print(f"   -> {len(links)} ruwe links gevonden. Filteren...")
+            print(f"   -> {len(links)} links gevonden op de pagina.")
             
             for link in links:
                 try:
                     href = link.get_attribute("href")
                     if not href: continue
                     
-                    # Filter op onze zenders
                     if not any(k in href for k in ALLOWED_KEYWORDS):
                         continue
                         
-                    # We willen alleen detail links, geen navigatie links
-                    if "/uitzending/" in href or "/programma/" in href:
-                         # UUID eruit vissen (laatste deel van URL)
-                         parts = href.split('/')
-                         # Soms eindigt het op een slash
-                         uuid = parts[-1] if parts[-1] else parts[-2]
-                         
-                         # Check of het eruit ziet als een UUID of ID (lange string of cijfers)
-                         if len(uuid) > 5:
-                             full_url = f"https://www.humo.be{href}"
-                             tasks.append((uuid, full_url))
+                    parts = href.split('/')
+                    # Pak het laatste deel dat niet leeg is
+                    uuid = next((p for p in reversed(parts) if p), None)
+                    
+                    # UUIDs zijn meestal lang (bv. hashes) of numeriek
+                    if uuid and len(uuid) > 5:
+                        full_url = f"https://www.humo.be{href}"
+                        tasks.append((uuid, full_url))
                 except:
                     continue
                 
@@ -101,14 +103,13 @@ def get_overview_uuids_with_browser():
         finally:
             browser.close()
             
-    # Unieke taken overhouden
+    # Unieke taken
     unique_tasks = list({t[0]: t for t in tasks}.values())
     return unique_tasks
 
 def scrape_detail(task):
     uuid, url = task
     try:
-        # We gebruiken requests met impersonate voor de details (sneller)
         resp = requests.get(url, impersonate="chrome110", timeout=20)
         
         if resp.status_code != 200: return None
@@ -118,11 +119,9 @@ def scrape_detail(task):
         if not match: return None
 
         data = json.loads(match.group(1))
-        # Soms zit het direct in details, soms moeten we zoeken
         details_map = data.get('details', {})
         details = details_map.get(uuid, {})
         
-        # Als we niets vinden, check of de UUID misschien anders is in de map
         if not details and len(details_map) == 1:
              details = list(details_map.values())[0]
 
@@ -153,12 +152,12 @@ def scrape_detail(task):
         return None
 
 def main():
-    print("🚀 Script gestart (Browser + Cookie Fix)...")
+    print("🚀 Script gestart (Target: 'Akkoord')...")
     
     tasks = get_overview_uuids_with_browser()
     
     if not tasks:
-        print("❌ Nog steeds 0 programma's. Check de screenshot in GitHub Actions Artifacts!")
+        print("❌ Geen programma's. Check 'debug_after_click.png' in Artifacts!")
         sys.exit(1)
         
     print(f"🔍 Stap 2: {len(tasks)} details scrapen...")
