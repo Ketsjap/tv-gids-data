@@ -1,4 +1,4 @@
-import cloudscraper
+from curl_cffi import requests
 import json
 import re
 from datetime import datetime
@@ -8,15 +8,6 @@ import sys
 import time
 
 # --- CONFIGURATIE ---
-# We gebruiken cloudscraper om de 403 blokkade te omzeilen
-scraper = cloudscraper.create_scraper(
-    browser={
-        'browser': 'chrome',
-        'platform': 'windows',
-        'desktop': True
-    }
-)
-
 ALLOWED_KEYWORDS = [
     "vtm", "vrt", "canvas", "ketnet", "play", "npo", "bbc", "national", "discovery", "tlc"
 ]
@@ -29,27 +20,24 @@ def get_overview_uuids():
     date = get_belgium_date()
     url = f"https://www.humo.be/tv-gids/api/v2/broadcasts/{date}"
     
-    print(f"📡 API Aanroepen: {url}")
+    print(f"📡 Stap 1: Overzicht ophalen voor {date}...")
     
     try:
-        # Gebruik scraper.get() ipv requests.get()
-        resp = scraper.get(url)
+        # We doen ons voor als Chrome 120
+        resp = requests.get(url, impersonate="chrome120", timeout=30)
         
         if resp.status_code != 200:
-            print(f"❌ API Fout: HTTP {resp.status_code} - {resp.reason}")
-            # Als cloudscraper faalt, print de body om te zien waarom (vaak Cloudflare captcha)
-            if resp.status_code == 403:
-                print("⚠️ Nog steeds geblokkeerd. Probeer de User-Agent te tweaken.")
+            print(f"❌ API Fout in Stap 1: HTTP {resp.status_code}")
             return []
             
         data = resp.json()
         tasks = []
         
         if 'channels' not in data:
-            print("❌ Geen 'channels' gevonden in API response.")
+            print("❌ Geen kanalen gevonden in de data.")
             return []
 
-        print(f"✅ API geladen. Kanalen scannen...")
+        print(f"✅ Stap 1 gelukt. UUID's verzamelen...")
         
         for ch in data['channels']:
             name = ch.get('name', '').lower()
@@ -59,24 +47,23 @@ def get_overview_uuids():
                 broadcasts = ch.get('broadcasts', [])
                 for b in broadcasts:
                     uuid = b.get('id')
+                    # We hebben de detail URL nodig voor Stap 2
                     url = f"https://www.humo.be/tv-gids/{slug}/uitzending/aflevering/{uuid}"
                     tasks.append((uuid, url))
         
         return tasks
 
     except Exception as e:
-        print(f"❌ Fatale fout in overview: {e}")
+        print(f"❌ Fatale fout in Stap 1: {e}")
         return []
 
 def scrape_detail(task):
     uuid, url = task
     try:
-        # Pauzeer heel even om de server niet te DDOS'en (helpt tegen blokkades)
-        time.sleep(0.1) 
+        # Ook hier doen we ons voor als Chrome
+        # Timeout iets langer zetten voor tragere connecties
+        resp = requests.get(url, impersonate="chrome120", timeout=20)
         
-        resp = scraper.get(url, timeout=15)
-        
-        if resp.status_code == 404: return None
         if resp.status_code != 200: return None
 
         html = resp.text
@@ -92,12 +79,14 @@ def scrape_detail(task):
         if season is None and episode is None: return None
 
         is_new = (episode == 1)
-        texts_to_check = [
+        
+        # Tekstuele check
+        texts = [
             details.get('subtitle', ''),
             details.get('alternativeDetailTitle', ''),
             details.get('synopsis', '')
         ]
-        full_text = " ".join([t for t in texts_to_check if t]).lower()
+        full_text = " ".join([t for t in texts if t]).lower()
         
         if "nieuw seizoen" in full_text or "start seizoen" in full_text:
             is_new = True
@@ -112,24 +101,28 @@ def scrape_detail(task):
         return None
 
 def main():
-    print("🚀 Script gestart met Cloudscraper...")
+    print("🚀 Script gestart (versie: curl_cffi)...")
+    
+    # STAP 1: Haal de lijst met UUID's
     tasks = get_overview_uuids()
     
     if not tasks:
-        print("❌ Geen taken gevonden. Stoppen.")
+        print("❌ Kon de lijst met programma's niet ophalen. Waarschijnlijk nog steeds geblokkeerd.")
         sys.exit(1)
         
-    print(f"🔍 {len(tasks)} detailpagina's scrapen...")
+    print(f"🔍 Stap 2: {len(tasks)} details scrapen (via Chrome vermomming)...")
     
     results = {}
-    # Iets minder workers om de server niet boos te maken
+    
+    # STAP 2: Scrape details per UUID
+    # We gebruiken 10 threads om niet te agressief te zijn
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = executor.map(scrape_detail, tasks)
         for res in futures:
             if res:
                 results[res[0]] = res[1]
 
-    print(f"💾 {len(results)} items succesvol verrijkt.")
+    print(f"💾 Klaar! {len(results)} items verrijkt.")
     
     with open('tv-enrichment.json', 'w') as f:
         json.dump(results, f, separators=(',', ':'))
