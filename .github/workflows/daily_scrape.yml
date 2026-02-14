@@ -28,6 +28,15 @@ jobs:
       - name: Run Scraper
         run: python scraper.py
 
+      # 👇 NIEUWE STAP: Upload screenshots als artifacts
+      - name: Upload Debug Screenshots
+        if: always() # Altijd doen, ook als het script faalt
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: "*.png"
+          retention-days: 5
+
       - name: Commit and Push changes
         run: |
           git config --global user.name "TVBot"
