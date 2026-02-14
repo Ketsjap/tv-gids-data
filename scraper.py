@@ -2,7 +2,9 @@ from playwright.sync_api import sync_playwright
 from curl_cffi import requests
 import json
 import re
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+import pytz
 import sys
 import time
 
@@ -11,11 +13,12 @@ ALLOWED_KEYWORDS = [
     "vtm", "vrt", "canvas", "ketnet", "play", "npo", "bbc", "national", "discovery", "tlc"
 ]
 
+def get_belgium_date():
+    tz = pytz.timezone('Europe/Brussels')
+    return datetime.now(tz).strftime("%Y-%m-%d")
+
 def get_overview_uuids_with_browser():
-    # 🔥 FIX 1: We gaan naar de root URL. Humo redirect zelf naar de juiste datum.
-    # Dit voorkomt 404 fouten als de datum-berekening net misloopt.
     url = "https://www.humo.be/tv-gids"
-    
     print(f"📡 Stap 1: Browser starten naar {url}...")
     
     tasks = []
@@ -27,84 +30,77 @@ def get_overview_uuids_with_browser():
         
         try:
             page.goto(url, timeout=60000, wait_until="domcontentloaded")
-            print("   -> Pagina geladen. Wachten op cookie banner...")
-            
-            # Wacht expliciet tot de pagina stabiel is
+            print("   -> Pagina geladen. Wachten op banner...")
             page.wait_for_timeout(3000)
 
-            # 🍪 COOKIE FIX: Geen regex meer, gebruik de exacte 'name' property
+            # 🍪 COOKIE HUNTER
+            clicked = False
             try:
-                # DPG gebruikt vaak shadow-dom of iframes, maar get_by_role kijkt daar dwars doorheen
-                accept_button = page.get_by_role("button", name="Akkoord")
-                
-                if accept_button.is_visible():
-                    print("   -> 🍪 'Akkoord' knop gevonden! Klikken...")
-                    accept_button.click()
-                    # Wacht op de reload die vaak volgt na cookies accepteren
-                    page.wait_for_timeout(4000)
-                else:
-                    print("   -> ⚠️ Geen 'Akkoord' knop direct zichtbaar. Probeer fallback...")
-                    # Fallback voor als het toch in een iframe zit dat get_by_role mist
-                    frames = page.frames
-                    clicked = False
-                    for frame in frames:
-                        btn = frame.get_by_role("button", name="Akkoord")
-                        if btn.is_visible():
-                            btn.click()
-                            print("   -> 🍪 'Akkoord' in iframe geklikt!")
+                # Probeer 'Akkoord' knop
+                btn = page.locator("button, a").filter(has_text=re.compile("(?i)^Akkoord$"))
+                if btn.count() > 0 and btn.first.is_visible():
+                    btn.first.click()
+                    print("   -> 🍪 'Akkoord' geklikt!")
+                    clicked = True
+            except: pass
+            
+            if not clicked:
+                # Fallback: iframes
+                for frame in page.frames:
+                    try:
+                        btn = frame.locator("button, a").filter(has_text=re.compile("(?i)^Akkoord$"))
+                        if btn.count() > 0 and btn.first.is_visible():
+                            btn.first.click()
+                            print(f"   -> 🍪 'Akkoord' geklikt in iframe!")
                             clicked = True
-                            page.wait_for_timeout(4000)
                             break
-                    
-                    if not clicked:
-                        print("   -> Geen klikbare banner gevonden. Misschien zijn we er al?")
+                    except: continue
 
-            except Exception as e:
-                print(f"   -> Fout bij klikken cookies: {e}")
+            if clicked:
+                page.wait_for_timeout(3000)
 
-            # Screenshot NA de klikpoging (voor debugging)
-            page.screenshot(path="debug_after_click.png", full_page=True)
+            # Screenshot ter controle
+            page.screenshot(path="debug_grid.png", full_page=True)
 
-            print("   -> Scrollen door de gids om lazy-loading te triggeren...")
-            # We scrollen iets agressiever
+            print("   -> Scrollen door de gids...")
+            # Iets agressiever scrollen om alles te laden
             for _ in range(8):
                 page.mouse.wheel(0, 1500)
                 page.wait_for_timeout(800)
             
-            # Zoek links - Specifiek naar uitzendingen
-            # We pakken de href attributen
+            # 🔥 NIEUWE STRATEGIE: Pak ALLE links, filter later
+            # We kijken specifiek naar links die een 'href' hebben
             links = page.evaluate("""() => {
-                return Array.from(document.querySelectorAll("a[href*='/uitzending/'], a[href*='/programma/']"))
-                            .map(a => a.href)
+                return Array.from(document.querySelectorAll('a[href]')).map(a => a.href)
             }""")
             
-            print(f"   -> {len(links)} links gevonden op de pagina.")
+            print(f"   -> {len(links)} totale links gevonden. Nu filteren...")
             
             for href in links:
-                try:
-                    # Filter op zenders
-                    if not any(k in href for k in ALLOWED_KEYWORDS):
-                        continue
+                # Moet een Humo link zijn en een van onze zenders bevatten
+                if "humo.be" not in href: continue
+                
+                # Check zender
+                if not any(k in href for k in ALLOWED_KEYWORDS): continue
+                
+                # Check of het een programma-link is
+                # Humo gebruikt soms /tv-gids/.../uitzending/... en soms /tv-gids/programma/...
+                if "/uitzending/" in href or "/programma/" in href:
                     
-                    # UUID extractie
-                    parts = href.split('/')
-                    # Filter lege onderdelen en pak de laatste
-                    parts = [p for p in parts if p]
+                    # UUID extractie: pak het laatste deel dat geen lege string is
+                    parts = [p for p in href.split('/') if p]
                     uuid = parts[-1]
                     
-                    # Simpele check of het een UUID lijkt (langer dan 5 chars)
+                    # UUID is meestal lang (hash) of numeriek ID
                     if len(uuid) > 5:
-                        tasks.append((uuid, href))
-                except:
-                    continue
+                         tasks.append((uuid, href))
                 
         except Exception as e:
             print(f"❌ Browser fout: {e}")
-            page.screenshot(path="error_page.png")
         finally:
             browser.close()
             
-    # Unieke taken
+    # Uniek maken
     unique_tasks = list({t[0]: t for t in tasks}.values())
     return unique_tasks
 
@@ -153,12 +149,12 @@ def scrape_detail(task):
         return None
 
 def main():
-    print("🚀 Script gestart (Target: 'Akkoord' zonder regex)...")
+    print("🚀 Script gestart (Link Harvest Mode)...")
     
     tasks = get_overview_uuids_with_browser()
     
     if not tasks:
-        print("❌ Geen programma's. Check 'debug_after_click.png' in Artifacts!")
+        print("❌ Geen TV-programma's gevonden. Bekijk 'debug_grid.png'.")
         sys.exit(1)
         
     print(f"🔍 Stap 2: {len(tasks)} details scrapen...")
