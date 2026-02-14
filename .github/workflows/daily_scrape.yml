@@ -2,8 +2,8 @@ name: Daily TV Scrape
 
 on:
   schedule:
-    - cron: '0 3 * * *' # Elke nacht om 03:00 UTC (04:00/05:00 BE tijd)
-  workflow_dispatch: # Zorgt dat je ook handmatig op 'Run' kan klikken
+    - cron: '0 3 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -21,7 +21,9 @@ jobs:
           python-version: '3.9'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
 
       - name: Run Scraper
         run: python scraper.py
