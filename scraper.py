@@ -1,24 +1,27 @@
-import requests
+import cloudscraper
 import json
 import re
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 import pytz
 import sys
+import time
 
 # --- CONFIGURATIE ---
-# Gebruik een echte User-Agent om niet geblokkeerd te worden
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-}
+# We gebruiken cloudscraper om de 403 blokkade te omzeilen
+scraper = cloudscraper.create_scraper(
+    browser={
+        'browser': 'chrome',
+        'platform': 'windows',
+        'desktop': True
+    }
+)
 
-# De kanalen die we willen (fuzzy match)
 ALLOWED_KEYWORDS = [
     "vtm", "vrt", "canvas", "ketnet", "play", "npo", "bbc", "national", "discovery", "tlc"
 ]
 
 def get_belgium_date():
-    """Haalt de huidige datum in België op (belangrijk voor GitHub servers!)"""
     tz = pytz.timezone('Europe/Brussels')
     return datetime.now(tz).strftime("%Y-%m-%d")
 
@@ -29,9 +32,14 @@ def get_overview_uuids():
     print(f"📡 API Aanroepen: {url}")
     
     try:
-        resp = requests.get(url, headers=HEADERS)
+        # Gebruik scraper.get() ipv requests.get()
+        resp = scraper.get(url)
+        
         if resp.status_code != 200:
-            print(f"❌ API Fout: HTTP {resp.status_code}")
+            print(f"❌ API Fout: HTTP {resp.status_code} - {resp.reason}")
+            # Als cloudscraper faalt, print de body om te zien waarom (vaak Cloudflare captcha)
+            if resp.status_code == 403:
+                print("⚠️ Nog steeds geblokkeerd. Probeer de User-Agent te tweaken.")
             return []
             
         data = resp.json()
@@ -45,17 +53,12 @@ def get_overview_uuids():
         
         for ch in data['channels']:
             name = ch.get('name', '').lower()
-            slug = name.replace(' ', '-') # Maak URL vriendelijk
+            slug = name.replace(' ', '-')
             
-            # Check of dit een kanaal is dat we willen
             if any(k in name for k in ALLOWED_KEYWORDS):
                 broadcasts = ch.get('broadcasts', [])
-                count = len(broadcasts)
-                # print(f"   -> {name}: {count} uitzendingen") # Uncomment voor debug
-                
                 for b in broadcasts:
                     uuid = b.get('id')
-                    # Bouw URL (Humo structuur)
                     url = f"https://www.humo.be/tv-gids/{slug}/uitzending/aflevering/{uuid}"
                     tasks.append((uuid, url))
         
@@ -68,46 +71,31 @@ def get_overview_uuids():
 def scrape_detail(task):
     uuid, url = task
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
+        # Pauzeer heel even om de server niet te DDOS'en (helpt tegen blokkades)
+        time.sleep(0.1) 
         
-        # 404 is normaal (niet elke uuid heeft een detailpagina)
-        if resp.status_code == 404:
-            return None
+        resp = scraper.get(url, timeout=15)
         
-        # Andere fouten zijn wel interessant
-        if resp.status_code != 200:
-            print(f"⚠️ {url} -> HTTP {resp.status_code}")
-            return None
+        if resp.status_code == 404: return None
+        if resp.status_code != 200: return None
 
         html = resp.text
-        
-        # Regex zoektocht
         match = re.search(r'window\.__EPG_REDUX_DATA__=(.*?);', html)
-        if not match:
-            # Soms is de pagina wel geladen, maar staat de data anders
-            return None
+        if not match: return None
 
-        # JSON parsen
         data = json.loads(match.group(1))
-        
-        # De data zit in 'details' -> uuid
         details = data.get('details', {}).get(uuid, {})
         
         season = details.get('seasonOrder')
         episode = details.get('order')
         
-        # Alleen opslaan als we nuttige info hebben
-        if season is None and episode is None:
-            return None
+        if season is None and episode is None: return None
 
-        # Slimme "Nieuw Seizoen" detectie
         is_new = (episode == 1)
-        
-        # Check ook tekstuele hints
         texts_to_check = [
             details.get('subtitle', ''),
             details.get('alternativeDetailTitle', ''),
-            details.get('synopsis', '') # Soms staat het in de synopsis
+            details.get('synopsis', '')
         ]
         full_text = " ".join([t for t in texts_to_check if t]).lower()
         
@@ -120,22 +108,22 @@ def scrape_detail(task):
             "is_new": is_new
         }
 
-    except Exception as e:
-        # print(f"⚠️ Error scraping {url}: {e}")
+    except Exception:
         return None
 
 def main():
-    print("🚀 Script gestart...")
+    print("🚀 Script gestart met Cloudscraper...")
     tasks = get_overview_uuids()
     
     if not tasks:
         print("❌ Geen taken gevonden. Stoppen.")
-        sys.exit(1) # Forceer een error in GitHub Actions zodat je een rode mail krijgt
+        sys.exit(1)
         
-    print(f"🔍 {len(tasks)} detailpagina's scrapen (max 20 tegelijk)...")
+    print(f"🔍 {len(tasks)} detailpagina's scrapen...")
     
     results = {}
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    # Iets minder workers om de server niet boos te maken
+    with ThreadPoolExecutor(max_workers=10) as executor:
         futures = executor.map(scrape_detail, tasks)
         for res in futures:
             if res:
@@ -143,7 +131,6 @@ def main():
 
     print(f"💾 {len(results)} items succesvol verrijkt.")
     
-    # Opslaan
     with open('tv-enrichment.json', 'w') as f:
         json.dump(results, f, separators=(',', ':'))
 
