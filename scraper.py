@@ -1,3 +1,4 @@
+from playwright.sync_api import sync_playwright
 from curl_cffi import requests
 import json
 import re
@@ -16,75 +17,71 @@ def get_belgium_date():
     tz = pytz.timezone('Europe/Brussels')
     return datetime.now(tz).strftime("%Y-%m-%d")
 
-def get_overview_uuids():
+def get_overview_uuids_with_browser():
     date = get_belgium_date()
-    # 🔥 VERANDERING: We roepen niet de API aan, maar de menselijke HTML pagina
-    url = f"https://www.humo.be/tv-gids/{date}"
+    url = f"https://www.humo.be/tv-gids/{date}/zenders" # De 'zenders' view laadt vaak meer data
     
-    print(f"📡 Stap 1: HTML Pagina ophalen: {url}...")
+    print(f"📡 Stap 1: Browser starten naar {url}...")
     
-    try:
-        # Headers om echt op een browser te lijken
-        headers = {
-            "Referer": "https://www.humo.be/tv-gids",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
-        }
+    tasks = []
+    
+    with sync_playwright() as p:
+        # Start een onzichtbare browser (headless)
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
         
-        # Impersonate Chrome 110 (iets ouder, vaak stabieler)
-        resp = requests.get(url, headers=headers, impersonate="chrome110", timeout=30)
-        
-        if resp.status_code != 200:
-            print(f"❌ Fout in Stap 1: HTTP {resp.status_code}")
-            return []
-
-        # Nu vissen we de JSON uit de HTML, net zoals bij de details
-        html = resp.text
-        match = re.search(r'window\.__EPG_REDUX_DATA__=(.*?);', html)
-        if not match:
-            print("❌ Kon de Redux data niet vinden in de overzichtspagina.")
-            return []
+        try:
+            # Ga naar de pagina
+            page.goto(url, timeout=60000)
             
-        data = json.loads(match.group(1))
-        tasks = []
-        
-        # De structuur in de HTML Redux state kan iets anders zijn dan de API
-        # We zoeken naar 'channels' in de root of onder 'tvGuide'
-        channels = data.get('channels') or data.get('tvGuide', {}).get('channels')
-        
-        if not channels:
-            # Soms zit het dieper verpakt
-            print("⚠️ Structuur anders dan verwacht, zoeken in hele JSON...")
-            # Fallback: zoek gewoon ergens naar een lijst die op kanalen lijkt
-            pass 
+            # Wacht even tot de grid geladen is (3 seconden)
+            page.wait_for_timeout(3000)
+            
+            # Scroll naar beneden om lazy-loading te triggeren
+            for _ in range(5):
+                page.mouse.wheel(0, 1000)
+                page.wait_for_timeout(500)
 
-        if channels:
-            print(f"✅ Stap 1 gelukt. {len(channels)} kanalen gevonden.")
-            for ch in channels:
-                name = ch.get('name', '').lower()
-                slug = name.replace(' ', '-')
+            # Zoek alle links die '/uitzending/' bevatten
+            # Dit zijn de blokjes in de gids
+            links = page.query_selector_all("a[href*='/uitzending/']")
+            
+            print(f"   -> {len(links)} links gevonden op de pagina.")
+            
+            for link in links:
+                href = link.get_attribute("href")
+                # href is vaak relatief, bv: /tv-gids/vtm/uitzending/film/b48a...
                 
-                if any(k in name for k in ALLOWED_KEYWORDS):
-                    broadcasts = ch.get('broadcasts', [])
-                    for b in broadcasts:
-                        uuid = b.get('id')
-                        # URL bouwen voor Stap 2
-                        url = f"https://www.humo.be/tv-gids/{slug}/uitzending/aflevering/{uuid}"
-                        tasks.append((uuid, url))
-        else:
-            print("❌ Geen kanalen gevonden in de JSON.")
-            return []
-        
-        return tasks
-
-    except Exception as e:
-        print(f"❌ Fatale fout in Stap 1: {e}")
-        return []
+                # Filter op zenders
+                if not any(k in href for k in ALLOWED_KEYWORDS):
+                    continue
+                
+                # Haal UUID uit de URL
+                # Formaat is meestal .../uitzending/type/UUID
+                parts = href.split('/')
+                uuid = parts[-1]
+                
+                # Bouw de volledige URL
+                full_url = f"https://www.humo.be{href}"
+                
+                # Voeg toe aan takenlijst (gebruik een set om dubbels te voorkomen later)
+                tasks.append((uuid, full_url))
+                
+        except Exception as e:
+            print(f"❌ Browser fout: {e}")
+        finally:
+            browser.close()
+            
+    # Dubbels verwijderen (UUID is uniek)
+    unique_tasks = list({t[0]: t for t in tasks}.values())
+    return unique_tasks
 
 def scrape_detail(task):
     uuid, url = task
     try:
-        # Stap 2 blijft hetzelfde
+        # Stap 2 doen we nog steeds met curl_cffi, dat is sneller dan 500x een browser openen
         resp = requests.get(url, impersonate="chrome110", timeout=20)
+        
         if resp.status_code != 200: return None
 
         html = resp.text
@@ -121,20 +118,21 @@ def scrape_detail(task):
         return None
 
 def main():
-    print("🚀 Script gestart (HTML Scrape Mode)...")
+    print("🚀 Script gestart (Browser Mode)...")
     
-    tasks = get_overview_uuids()
+    # STAP 1: Browser gebruiken om links te vinden
+    tasks = get_overview_uuids_with_browser()
     
     if not tasks:
-        print("❌ Mislukt. Geen programma's gevonden.")
+        print("❌ Geen programma's gevonden via de browser.")
         sys.exit(1)
         
     print(f"🔍 Stap 2: {len(tasks)} details scrapen...")
     
     results = {}
     
-    # Iets conservatiever: 8 threads
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    # STAP 2: Details ophalen
+    with ThreadPoolExecutor(max_workers=10) as executor:
         futures = executor.map(scrape_detail, tasks)
         for res in futures:
             if res:
