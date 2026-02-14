@@ -1,0 +1,35 @@
+name: Daily TV Scrape
+
+on:
+  schedule:
+    - cron: '0 3 * * *' # Elke nacht om 03:00 UTC (04:00/05:00 BE tijd)
+  workflow_dispatch: # Zorgt dat je ook handmatig op 'Run' kan klikken
+
+permissions:
+  contents: write
+
+jobs:
+  scrape-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run Scraper
+        run: python scraper.py
+
+      - name: Commit and Push changes
+        run: |
+          git config --global user.name "TVBot"
+          git config --global user.email "bot@tvtips.local"
+          git add tv-enrichment.json
+          git commit -m "Update TV data" || echo "No changes to commit"
+          git push
